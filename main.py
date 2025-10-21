@@ -1,13 +1,13 @@
-# app/main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Any
+from typing import List
 import sympy as sp
 from sympy.solvers.ode import classify_ode
 from sympy import dsolve, Function, Eq
 
-app = FastAPI(title="EDO Solver API")
+app = FastAPI(title="EDO Solver API", version="1.0")
 
+# ---------- MODELOS ----------
 class SolveRequest(BaseModel):
     ode: str
     var: str = "x"
@@ -19,125 +19,129 @@ class SolveResponse(BaseModel):
     is_homogeneous: bool
     homogeneity_explanation: str
     solution: str
+    latex_solution: str
     steps: List[str]
-    raw_sympy: str
+    latex_steps: List[str]
 
+# ---------- UTILIDADES ----------
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "EDO Solver API activa"}
 
 def parse_ode(text, var_sym, func_sym):
-    # Intent: try parse expressions like "dy/dx = ...", "y' + 2*x*y = sin(x)"
-    # We attempt several parse strategies.
     x = var_sym
     y = func_sym(x)
-    # Replace common notations to sympy friendly:
-    txt = text.replace("dy/dx", "Derivative(y, x)").replace("y'", "Derivative(y, x)")
-    # Provide local symbols
-    local_dict = { 'x': x, 'y': y, 'Derivative': sp.Derivative }
+    txt = (
+        text.replace("dy/dx", "Derivative(y, x)")
+            .replace("y'", "Derivative(y, x)")
+            .replace("^", "**")
+    )
+    local_dict = {"x": x, "y": y, "Derivative": sp.Derivative}
     try:
-        # Try to parse an equation
         expr = sp.sympify(txt, locals=local_dict)
-        # If it's an equation object, keep it; else try to make Eq(expr,0)
         if isinstance(expr, sp.Equality):
-            eq = expr
-        else:
-            # If expression contains Derivative(...) try to find LHS containing derivative
-            # Fallback: Eq(expr,0)
-            eq = Eq(expr, 0)
-        return eq
-    except Exception as e:
-        # Last resort: try to split at '='
+            return expr
+        return Eq(expr, 0)
+    except Exception:
         if "=" in text:
             left, right = text.split("=", 1)
-            try:
-                left_s = sp.sympify(left, locals=local_dict)
-                right_s = sp.sympify(right, locals=local_dict)
-                return Eq(left_s, right_s)
-            except Exception:
-                pass
-        raise e
+            left_s = sp.sympify(left, locals=local_dict)
+            right_s = sp.sympify(right, locals=local_dict)
+            return Eq(left_s, right_s)
+        raise ValueError("No se pudo interpretar la ecuación diferencial")
 
 def is_homogeneous_first_order(eq, x, yfun):
-    # checks dy/dx = f(y/x) or can be rearranged to that form
-    # This is a heuristic: create f = rhs / lhs etc.
     try:
-        # try to get dy/dx = RHS
         if isinstance(eq, sp.Equality):
-            lhs = eq.lhs
-            rhs = eq.rhs
-            # solve for Derivative(y,x)
             deriv = sp.Derivative(yfun(x), x)
-            sol_for_deriv = sp.solve(Eq(lhs, rhs), deriv)
-            if sol_for_deriv:
-                f = sp.simplify(sol_for_deriv[0])
-            else:
-                # try if eq is Derivative(y,x) - f(x,y) = 0
-                # move everything to rhs
-                expr = sp.simplify(lhs - rhs)
-                # isolate derivative
-                expr = sp.solve(expr, deriv)
-                f = expr[0] if expr else None
-            if f is None:
+            sol_for_deriv = sp.solve(eq, deriv)
+            if not sol_for_deriv:
                 return False, "No se pudo aislar dy/dx"
-            # check if f(x,y) can be expressed as g(y/x)
-            t = sp.symbols('t')
-            gx = sp.simplify(f.subs({x: x, yfun(x): t*x}))  # replace y by t*x => f(x, t*x)
-            # if independent of x after substitution -> homogeneous of degree 0
-            gx_s = sp.simplify(sp.factor(gx))
-            free_symbols = gx_s.free_symbols
-            if x in free_symbols:
-                # still depends on x -> not homogeneous in this test
-                return False, "Al sustituir y = t*x la expresión depende de x"
+            f = sp.simplify(sol_for_deriv[0])
+            t = sp.Symbol("t")
+            gx = sp.simplify(f.subs({yfun(x): t * x}))
+            if x in gx.free_symbols:
+                return False, "Depende de x después de sustituir y = tx"
             else:
-                return True, "Se puede escribir como f(y/x)"
+                return True, "Se puede expresar como f(y/x)"
         return False, "Ecuación no es igualdad"
     except Exception as e:
         return False, f"Error al analizar homogeneidad: {e}"
 
 def generate_steps_for_first_order(eq, x, y):
-    steps = []
+    steps, latex_steps = [], []
     try:
-        # classify via sympy
         methods = classify_ode(eq, y(x))
         steps.append(f"Clasificación SymPy: {methods}")
-        # check separable
-        if 'separable' in methods:
-            steps.append("Método: Separable. Procedimiento:")
-            # try to separate: dy/dx = g(x)*h(y)
-            sol = dsolve(eq)
-            steps.append("1) Reescriba como dy/dx = g(x) * h(y).")
-            steps.append("2) Separe variables: dy/h(y) = g(x) dx.")
-            steps.append("3) Integre ambos lados y + C.")
-            steps.append(f"Solución (SymPy): {sp.pretty(sol)}")
-            return steps
-        if 'linear' in methods:
-            steps.append("Método: Ecuación lineal de primer orden. Procedimiento:")
-            steps.append("1) Reescribir en forma y' + P(x)*y = Q(x).")
-            steps.append("2) Calcular factor integrante μ(x)=exp(∫P(x)dx).")
-            steps.append("3) Multiplicar ecuación por μ(x) y simplificar -> (μ y)' = μ Q.")
-            steps.append("4) Integrar: μ y = ∫ μ Q dx + C.")
-            sol = dsolve(eq)
-            steps.append(f"Solución (SymPy): {sp.pretty(sol)}")
-            return steps
-        if 'exact' in methods:
-            steps.append("Método: Exacta. Procedimiento:")
-            steps.append("1) Comprobar M dx + N dy = 0 con ∂M/∂y = ∂N/∂x.")
-            steps.append("2) Encontrar función potencial Φ tal que Φ_x = M, Φ_y = N.")
-            sol = dsolve(eq)
-            steps.append(f"Solución (SymPy): {sp.pretty(sol)}")
-            return steps
-        # Fallback: return classification + sympy solution
-        sol = dsolve(eq)
-        steps.append("No se detectó un método simple implementado. Se devuelve la clasificación y la solución de SymPy.")
-        steps.append(f"Solución (SymPy): {sp.pretty(sol)}")
-        return steps
-    except Exception as e:
-        return [f"Error generando pasos automáticos: {e}"]
+        latex_steps.append(f"\\textbf{{Clasificación SymPy:}}\\ {methods}")
 
+        if "separable" in methods:
+            sol = dsolve(eq)
+            steps += [
+                "Método: Separable",
+                "1) Escriba en forma dy/dx = g(x)h(y)",
+                "2) Separe variables: dy/h(y) = g(x) dx",
+                "3) Integre ambos lados",
+                f"Solución: {sol}"
+            ]
+            latex_steps += [
+                "\\text{Método: Separable}",
+                "1) \\text{Escriba en forma } \\frac{dy}{dx} = g(x)h(y)",
+                "2) \\text{Separe variables: } \\frac{dy}{h(y)} = g(x)\\,dx",
+                "3) \\text{Integre ambos lados}",
+                f"\\textbf{{Solución:}}\\ {sp.latex(sol)}"
+            ]
+            return steps, latex_steps
+
+        if "linear" in methods:
+            sol = dsolve(eq)
+            steps += [
+                "Método: Lineal de primer orden",
+                "1) Forma estándar: y' + P(x)y = Q(x)",
+                "2) Calcular μ(x) = e^{∫P(x)dx}",
+                "3) Multiplicar la ecuación por μ(x)",
+                "4) Integrar ambos lados",
+                f"Solución: {sol}"
+            ]
+            latex_steps += [
+                "\\text{Método: Lineal de primer orden}",
+                "1) \\text{Forma estándar: } y' + P(x)y = Q(x)",
+                "2) \\mu(x) = e^{\\int P(x)dx}",
+                "3) \\text{Multiplicar por } \\mu(x)",
+                "4) \\text{Integrar ambos lados}",
+                f"\\textbf{{Solución:}}\\ {sp.latex(sol)}"
+            ]
+            return steps, latex_steps
+
+        if "exact" in methods:
+            sol = dsolve(eq)
+            steps += [
+                "Método: Exacta",
+                "1) Verificar ∂M/∂y = ∂N/∂x",
+                "2) Encontrar Φ tal que Φ_x = M, Φ_y = N",
+                f"Solución: {sol}"
+            ]
+            latex_steps += [
+                "\\text{Método: Exacta}",
+                "1) \\text{Verificar } \\frac{\\partial M}{\\partial y} = \\frac{\\partial N}{\\partial x}",
+                "2) \\text{Encontrar } \\Phi\\ \\text{tal que } \\Phi_x = M, \\Phi_y = N",
+                f"\\textbf{{Solución:}}\\ {sp.latex(sol)}"
+            ]
+            return steps, latex_steps
+
+        sol = dsolve(eq)
+        steps.append("No se detectó un método simple. Se usa dsolve().")
+        latex_steps.append("\\text{No se detectó un método simple. Se usa dsolve().}")
+        latex_steps.append(f"\\textbf{{Solución:}}\\ {sp.latex(sol)}")
+        return steps, latex_steps
+
+    except Exception as e:
+        return [f"Error al generar pasos: {e}"], [f"\\text{{Error al generar pasos: {e}}}"]
+
+# ---------- ENDPOINT PRINCIPAL ----------
 @app.post("/api/solve", response_model=SolveResponse)
 def solve(req: SolveRequest):
-    x = sp.symbols(req.var)
+    x = sp.Symbol(req.var)
     y = Function(req.function)
 
     try:
@@ -147,38 +151,38 @@ def solve(req: SolveRequest):
             status="error",
             classification=[],
             is_homogeneous=False,
-            homogeneity_explanation=f"Error al parsear la ecuación: {e}",
+            homogeneity_explanation=str(e),
             solution="",
-            steps=[f"Error al parsear la ecuación: {e}"],
-            raw_sympy=str(e)
+            latex_solution="",
+            steps=[str(e)],
+            latex_steps=[f"\\text{{Error: {e}}}"]
         )
 
-    # classification
-    try:
-        cls = classify_ode(eq, y(x))
-    except Exception:
-        cls = []
-    # homogeneity check (heuristic for first-order)
+    classification = [str(c) for c in classify_ode(eq, y(x))]
     is_hom, expl = is_homogeneous_first_order(eq, x, y)
-    # solution
+
     try:
         sol = dsolve(eq)
-        sol_str = sp.srepr(sol)
+        sol_str = str(sol)
+        sol_latex = sp.latex(sol)
     except Exception as e:
-        sol_str = f"SymPy no pudo resolver: {e}"
+        sol_str = f"Error resolviendo: {e}"
+        sol_latex = f"\\text{{Error resolviendo: {e}}}"
 
-    # steps (try to make detailed steps for first-order simple types)
-    steps = generate_steps_for_first_order(eq, x, y)
+    steps, latex_steps = generate_steps_for_first_order(eq, x, y)
 
     return SolveResponse(
         status="ok",
-        classification=list(map(str, cls)),
+        classification=classification,
         is_homogeneous=is_hom,
         homogeneity_explanation=expl,
-        solution=str(sol),
+        solution=sol_str,
+        latex_solution=sol_latex,
         steps=steps,
-        raw_sympy=sol_str
+        latex_steps=latex_steps
     )
+
+# ---------- ARRANQUE LOCAL ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
