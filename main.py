@@ -4,6 +4,7 @@ from typing import List
 import sympy as sp
 from sympy import Function, Eq, dsolve
 from sympy.solvers.ode import classify_ode
+import os
 
 app = FastAPI(
     title="EDO Solver API",
@@ -182,3 +183,7 @@ def solve(req: SolveRequest):
         steps=steps,
         latex_steps=latex_steps
     )
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
