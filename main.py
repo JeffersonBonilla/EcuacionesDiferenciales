@@ -2,10 +2,14 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List
 import sympy as sp
+from sympy import Function, Eq, dsolve
 from sympy.solvers.ode import classify_ode
-from sympy import dsolve, Function, Eq
 
-app = FastAPI(title="EDO Solver API", version="1.0")
+app = FastAPI(
+    title="EDO Solver API",
+    version="1.0",
+    description="API para resolver ecuaciones diferenciales ordinarias simbólicamente usando SymPy."
+)
 
 # ---------- MODELOS ----------
 class SolveRequest(BaseModel):
@@ -24,10 +28,6 @@ class SolveResponse(BaseModel):
     latex_steps: List[str]
 
 # ---------- UTILIDADES ----------
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "message": "EDO Solver API activa"}
-
 def parse_ode(text, var_sym, func_sym):
     x = var_sym
     y = func_sym(x)
@@ -36,7 +36,7 @@ def parse_ode(text, var_sym, func_sym):
             .replace("y'", "Derivative(y, x)")
             .replace("^", "**")
     )
-    local_dict = {"x": x, "y": y, "Derivative": sp.Derivative}
+    local_dict = {"x": x, "y": y, "Derivative": sp.Derivative, "sin": sp.sin, "cos": sp.cos, "exp": sp.exp}
     try:
         expr = sp.sympify(txt, locals=local_dict)
         if isinstance(expr, sp.Equality):
@@ -68,7 +68,7 @@ def is_homogeneous_first_order(eq, x, yfun):
     except Exception as e:
         return False, f"Error al analizar homogeneidad: {e}"
 
-def generate_steps_for_first_order(eq, x, y):
+def generate_steps(eq, x, y):
     steps, latex_steps = [], []
     try:
         methods = classify_ode(eq, y(x))
@@ -138,12 +138,15 @@ def generate_steps_for_first_order(eq, x, y):
     except Exception as e:
         return [f"Error al generar pasos: {e}"], [f"\\text{{Error al generar pasos: {e}}}"]
 
-# ---------- ENDPOINT PRINCIPAL ----------
+# ---------- ENDPOINTS ----------
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "message": "EDO Solver API activa"}
+
 @app.post("/api/solve", response_model=SolveResponse)
 def solve(req: SolveRequest):
     x = sp.Symbol(req.var)
     y = Function(req.function)
-
     try:
         eq = parse_ode(req.ode, x, y)
     except Exception as e:
@@ -160,7 +163,6 @@ def solve(req: SolveRequest):
 
     classification = [str(c) for c in classify_ode(eq, y(x))]
     is_hom, expl = is_homogeneous_first_order(eq, x, y)
-
     try:
         sol = dsolve(eq)
         sol_str = str(sol)
@@ -169,8 +171,7 @@ def solve(req: SolveRequest):
         sol_str = f"Error resolviendo: {e}"
         sol_latex = f"\\text{{Error resolviendo: {e}}}"
 
-    steps, latex_steps = generate_steps_for_first_order(eq, x, y)
-
+    steps, latex_steps = generate_steps(eq, x, y)
     return SolveResponse(
         status="ok",
         classification=classification,
@@ -181,8 +182,3 @@ def solve(req: SolveRequest):
         steps=steps,
         latex_steps=latex_steps
     )
-
-# ---------- ARRANQUE LOCAL ----------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
