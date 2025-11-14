@@ -2,3 +2,4 @@ fastapi
 uvicorn
 sympy
 pydantic
+python-multipart
