@@ -1,189 +1,285 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from sympy import symbols, Eq, Function, Derivative, dsolve, exp, integrate
+from sympy.parsing.sympy_parser import parse_expr
 import sympy as sp
-from sympy import Function, Eq, dsolve
-from sympy.solvers.ode import classify_ode
-import os
+import re
 
-app = FastAPI(
-    title="EDO Solver API",
-    version="1.0",
-    description="API para resolver ecuaciones diferenciales ordinarias simbólicamente usando SymPy."
+app = FastAPI(title="EcuSolver API")
+
+# Habilitar CORS para Android
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # Permitir todas las IPs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ---------- MODELOS ----------
+# Variables simbólicas globales
+x = symbols('x')
+y = Function('y')
+
 class SolveRequest(BaseModel):
-    ode: str
-    var: str = "x"
-    function: str = "y"
+    equation: str
 
-class SolveResponse(BaseModel):
-    status: str
-    classification: List[str]
-    is_homogeneous: bool
-    homogeneity_explanation: str
-    solution: str
-    latex_solution: str
-    steps: List[str]
-    latex_steps: List[str]
+# Funcion auxiliar: resolver ecuaciones lineales
 
-# ---------- UTILIDADES ----------
-def parse_ode(text, var_sym, func_sym):
-    x = var_sym
-    y = func_sym(x)
-    txt = (
-        text.replace("dy/dx", "Derivative(y, x)")
-            .replace("y'", "Derivative(y, x)")
-            .replace("^", "**")
-    )
-    local_dict = {"x": x, "y": y, "Derivative": sp.Derivative, "sin": sp.sin, "cos": sp.cos, "exp": sp.exp}
+def solve_linear_detailed(req: SolveRequest):
+    print(f"DEBUG: Recibida ecuación: {req.equation}")
     try:
-        expr = sp.sympify(txt, locals=local_dict)
-        if isinstance(expr, sp.Equality):
-            return expr
-        return Eq(expr, 0)
-    except Exception:
-        if "=" in text:
-            left, right = text.split("=", 1)
-            left_s = sp.sympify(left, locals=local_dict)
-            right_s = sp.sympify(right, locals=local_dict)
-            return Eq(left_s, right_s)
-        raise ValueError("No se pudo interpretar la ecuación diferencial")
 
-def is_homogeneous_first_order(eq, x, yfun):
-    try:
-        if isinstance(eq, sp.Equality):
-            deriv = sp.Derivative(yfun(x), x)
-            sol_for_deriv = sp.solve(eq, deriv)
-            if not sol_for_deriv:
-                return False, "No se pudo aislar dy/dx"
-            f = sp.simplify(sol_for_deriv[0])
-            t = sp.Symbol("t")
-            gx = sp.simplify(f.subs({yfun(x): t * x}))
-            if x in gx.free_symbols:
-                return False, "Depende de x después de sustituir y = tx"
-            else:
-                return True, "Se puede expresar como f(y/x)"
-        return False, "Ecuación no es igualdad"
-    except Exception as e:
-        return False, f"Error al analizar homogeneidad: {e}"
-
-def generate_steps(eq, x, y):
-    steps, latex_steps = [], []
-    try:
-        methods = classify_ode(eq, y(x))
-        steps.append(f"Clasificación SymPy: {methods}")
-        latex_steps.append(f"\\textbf{{Clasificación SymPy:}}\\ {methods}")
-
-        if "separable" in methods:
-            sol = dsolve(eq)
-            steps += [
-                "Método: Separable",
-                "1) Escriba en forma dy/dx = g(x)h(y)",
-                "2) Separe variables: dy/h(y) = g(x) dx",
-                "3) Integre ambos lados",
-                f"Solución: {sol}"
-            ]
-            latex_steps += [
-                "\\text{Método: Separable}",
-                "1) \\text{Escriba en forma } \\frac{dy}{dx} = g(x)h(y)",
-                "2) \\text{Separe variables: } \\frac{dy}{h(y)} = g(x)\\,dx",
-                "3) \\text{Integre ambos lados}",
-                f"\\textbf{{Solución:}}\\ {sp.latex(sol)}"
-            ]
-            return steps, latex_steps
-
-        if "linear" in methods:
-            sol = dsolve(eq)
-            steps += [
-                "Método: Lineal de primer orden",
-                "1) Forma estándar: y' + P(x)y = Q(x)",
-                "2) Calcular μ(x) = e^{∫P(x)dx}",
-                "3) Multiplicar la ecuación por μ(x)",
-                "4) Integrar ambos lados",
-                f"Solución: {sol}"
-            ]
-            latex_steps += [
-                "\\text{Método: Lineal de primer orden}",
-                "1) \\text{Forma estándar: } y' + P(x)y = Q(x)",
-                "2) \\mu(x) = e^{\\int P(x)dx}",
-                "3) \\text{Multiplicar por } \\mu(x)",
-                "4) \\text{Integrar ambos lados}",
-                f"\\textbf{{Solución:}}\\ {sp.latex(sol)}"
-            ]
-            return steps, latex_steps
-
-        if "exact" in methods:
-            sol = dsolve(eq)
-            steps += [
-                "Método: Exacta",
-                "1) Verificar ∂M/∂y = ∂N/∂x",
-                "2) Encontrar Φ tal que Φ_x = M, Φ_y = N",
-                f"Solución: {sol}"
-            ]
-            latex_steps += [
-                "\\text{Método: Exacta}",
-                "1) \\text{Verificar } \\frac{\\partial M}{\\partial y} = \\frac{\\partial N}{\\partial x}",
-                "2) \\text{Encontrar } \\Phi\\ \\text{tal que } \\Phi_x = M, \\Phi_y = N",
-                f"\\textbf{{Solución:}}\\ {sp.latex(sol)}"
-            ]
-            return steps, latex_steps
-
-        sol = dsolve(eq)
-        steps.append("No se detectó un método simple. Se usa dsolve().")
-        latex_steps.append("\\text{No se detectó un método simple. Se usa dsolve().}")
-        latex_steps.append(f"\\textbf{{Solución:}}\\ {sp.latex(sol)}")
-        return steps, latex_steps
-
-    except Exception as e:
-        return [f"Error al generar pasos: {e}"], [f"\\text{{Error al generar pasos: {e}}}"]
-
-# ---------- ENDPOINTS ----------
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "message": "EDO Solver API activa"}
-
-@app.post("/api/solve", response_model=SolveResponse)
-def solve(req: SolveRequest):
-    x = sp.Symbol(req.var)
-    y = Function(req.function)
-    try:
-        eq = parse_ode(req.ode, x, y)
-    except Exception as e:
-        return SolveResponse(
-            status="error",
-            classification=[],
-            is_homogeneous=False,
-            homogeneity_explanation=str(e),
-            solution="",
-            latex_solution="",
-            steps=[str(e)],
-            latex_steps=[f"\\text{{Error: {e}}}"]
+        original_eq_latex = (
+            req.equation
+            .replace("dy/dx", r"\frac{dy}{dx}")
+            .replace("*", "")
+            .replace("=", " = ")
         )
 
-    classification = [str(c) for c in classify_ode(eq, y(x))]
-    is_hom, expl = is_homogeneous_first_order(eq, x, y)
-    try:
-        sol = dsolve(eq)
-        sol_str = str(sol)
-        sol_latex = sp.latex(sol)
-    except Exception as e:
-        sol_str = f"Error resolviendo: {e}"
-        sol_latex = f"\\text{{Error resolviendo: {e}}}"
+        # Normalizar para SymPy
+        expr_str = req.equation.strip()
+        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        expr_str = (
+            expr_str.replace("dy/dx", "Derivative(y(x), x)")
+            .replace("y'", "Derivative(y(x), x)")
+            .replace("y''", "Derivative(y(x), (x,2))")
+            .replace("^", "**")
+        )
 
-    steps, latex_steps = generate_steps(eq, x, y)
-    return SolveResponse(
-        status="ok",
-        classification=classification,
-        is_homogeneous=is_hom,
-        homogeneity_explanation=expl,
-        solution=sol_str,
-        latex_solution=sol_latex,
-        steps=steps,
-        latex_steps=latex_steps
-    )
+        if "=" in expr_str:
+            left, right = expr_str.split("=", 1)
+            expr_str = f"({left.strip()}) - ({right.strip()})"
+
+        local_dict = {'x': x, 'y': y, 'Derivative': Derivative}
+        expr = parse_expr(expr_str, local_dict=local_dict)
+        eq = Eq(expr, 0)
+        print(f"DEBUG: Ecuación SymPy: {eq}")
+
+        # Resolver con SymPy
+        sol = dsolve(eq)
+        if sol is None:
+            raise ValueError("SymPy no pudo resolver la ecuación.")
+        print(f"DEBUG: Solución cruda: {sol}")
+
+        # Simplificar solucion
+        rhs = sp.cancel(sol.rhs)
+        rhs = sp.expand(rhs)
+        sol = Eq(sol.lhs, rhs)
+        print(f"DEBUG: Solución simplificada: {sol}")
+
+        # Coeficientes de la ecuacion lineal: dy/dx + P(x)y = Q(x)
+        dy_dx = Derivative(y(x), x)
+        a_coeff = expr.coeff(dy_dx)
+        b_coeff = expr.coeff(y(x))
+        c_coeff = expr - a_coeff * dy_dx - b_coeff * y(x)
+
+        if a_coeff != 0:
+            P = b_coeff / a_coeff
+            Q = -c_coeff / a_coeff
+        else:
+            P = 0
+            Q = -expr / b_coeff
+
+        # Factor integrante
+        integral_P = integrate(P, x)
+        mu = exp(integral_P)
+
+        # Pasos en formato LaTeX
+        steps = [
+            f"Ecuación original: $${original_eq_latex}$$",
+            f"Forma estándar: $$\\frac{{dy}}{{dx}} + ({sp.latex(P)})y = {sp.latex(Q)}$$",
+            f"Factor integrante ($\\mu(x)$): $$e^{{\\int {sp.latex(P)} dx}} = e^{{{sp.latex(integral_P)}}} = {sp.latex(mu)}$$",
+            f"Multiplicamos por $\\mu(x)$: $${sp.latex(mu)}\\frac{{dy}}{{dx}} + {sp.latex(mu)}({sp.latex(P)})y = {sp.latex(mu)}({sp.latex(Q)})$$",
+            f"Integración: $${sp.latex(mu)}y = \\int {sp.latex(mu)}({sp.latex(Q)})\\,dx$$",
+            f"Solución general: $${sp.latex(sol)}$$"
+        ]
+
+        return {"steps": steps}
+
+    except Exception as e:
+        print(f"DEBUG: Error en solve_linear_detailed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error al resolver: {str(e)}")
+
+# Funcion auxiliar: resolver homogenea de primer orden
+
+def solve_homogeneous_first_detailed(req: SolveRequest):
+    print(f"DEBUG: Recibida ecuación: {req.equation}")
+    try:
+        original_eq_latex = (
+            req.equation
+            .replace("dy/dx", r"\frac{dy}{dx}")
+            .replace("*", "")
+            .replace("=", " = ")
+        )
+
+        # Normalizar para SymPy
+        expr_str = req.equation.strip()
+        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        expr_str = expr_str.replace("dy/dx", "Derivative(y(x), x)").replace("^", "**")
+
+        if "=" in expr_str:
+            left, right = expr_str.split("=", 1)
+            expr_str = f"({left.strip()}) - ({right.strip()})"
+
+        local_dict = {'x': x, 'y': y, 'Derivative': Derivative}
+        expr = parse_expr(expr_str, local_dict=local_dict)
+        eq = Eq(expr, 0)
+        print(f"DEBUG: Ecuación SymPy: {eq}")
+
+        # Resolver con SymPy
+        sol = dsolve(eq)
+        if sol is None:
+            raise ValueError("SymPy no pudo resolver la ecuación.")
+        print(f"DEBUG: Solución cruda: {sol}")
+
+        # Simplificar
+        rhs = sp.cancel(sol.rhs)
+        rhs = sp.expand(rhs)
+        sol = Eq(sol.lhs, rhs)
+        print(f"DEBUG: Solución simplificada: {sol}")
+
+        # Pasos para homogenea de primer orden (cambio de variable v = y/x)
+        steps = [
+            f"Ecuación original: $${original_eq_latex}$$",
+            f"Forma homogénea: $$\\frac{{dy}}{{dx}} = f\\left(\\frac{{y}}{{x}}\\right)$$",
+            f"Cambio de variable: $$v = \\frac{{y}}{{x}}$$ entonces $$y = v x$$ y $$\\frac{{dy}}{{dx}} = v + x \\frac{{dv}}{{dx}}$$",
+            f"Sustituyendo: $$v + x \\frac{{dv}}{{dx}} = f(v)$$",
+            f"Separando variables: $$\\frac{{dv}}{{f(v) - v}} = \\frac{{dx}}{{x}}$$",
+            f"Integrando: $$\\int \\frac{{dv}}{{f(v) - v}} = \\int \\frac{{dx}}{{x}}$$",
+            f"Solución general: $${sp.latex(sol)}$$"
+        ]
+
+        return {"steps": steps}
+
+    except Exception as e:
+        print(f"DEBUG: Error en solve_homogeneous_first_detailed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error al resolver: {str(e)}")
+
+
+# Funcion: resolver homogenea de segundo orden (con pasos)
+
+def solve_homogeneous_second_detailed(req: SolveRequest):
+    print(f"DEBUG: Recibida ecuación: {req.equation}")
+    try:
+        r = symbols('r') 
+
+        original_eq_latex = (
+            req.equation
+            .replace("d²y/dx²", r"\frac{d^2 y}{dx^2}")
+            .replace("dy/dx", r"\frac{dy}{dx}")
+            .replace("*", "")
+            .replace("=", " = ")
+        )
+
+        # Normalizar para SymPy
+        expr_str = req.equation.strip()
+        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        expr_str = (
+            expr_str.replace("d²y/dx²", "Derivative(y(x), (x,2))")
+            .replace("dy/dx", "Derivative(y(x), x)")
+            .replace("^", "**")
+        )
+
+        if "=" in expr_str:
+            left, right = expr_str.split("=", 1)
+            expr_str = f"({left.strip()}) - ({right.strip()})"
+
+        local_dict = {'x': x, 'y': y, 'Derivative': Derivative}
+        expr = parse_expr(expr_str, local_dict=local_dict)
+        eq = Eq(expr, 0)
+        print(f"DEBUG: Ecuación SymPy: {eq}")
+
+        # Resolver con SymPy
+        sol = dsolve(eq)
+        if sol is None:
+            raise ValueError("SymPy no pudo resolver la ecuación.")
+        print(f"DEBUG: Solución cruda: {sol}")
+
+        # Simplificar
+        rhs = sp.cancel(sol.rhs)
+        rhs = sp.expand(rhs)
+        sol = Eq(sol.lhs, rhs)
+        print(f"DEBUG: Solución simplificada: {sol}")
+
+        # Pasos para homogenea
+        steps = [
+            f"Ecuación original: $${original_eq_latex}$$",
+            f"Forma estándar: $$y'' + P(x) y' + Q(x) y = 0$$",
+            f"Asumimos solución: $$y = e^{{{sp.latex(r)} x}}$$",
+            f"Sustituyendo: $${sp.latex(r)}^2 e^{{{sp.latex(r)} x}} + P(x) {sp.latex(r)} e^{{{sp.latex(r)} x}} + Q(x) e^{{{sp.latex(r)} x}} = 0$$",
+            f"Ecuación característica: $${sp.latex(r)}^2 + P(x) {sp.latex(r)} + Q(x) = 0$$",
+            f"Resolviendo la ecuación característica...",
+            f"Solución general: $${sp.latex(sol)}$$"
+        ]
+
+        return {"steps": steps}
+
+    except Exception as e:
+        print(f"DEBUG: Error en solve_homogeneous_second_detailed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error al resolver: {str(e)}")
+
+# auxiliar: resolver ecuación general (cualquier tipo)
+def solve_equation_general(req: SolveRequest, eq_type: str = "general"):
+    print(f"DEBUG: Recibida ecuación: {req.equation}")
+    try:
+        expr_str = req.equation.strip()
+        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        expr_str = (
+            expr_str.replace("dy/dx", "Derivative(y(x), x)")
+            .replace("y'", "Derivative(y(x), x)")
+            .replace("y''", "Derivative(y(x), (x,2))")
+            .replace("^", "**")
+        )
+
+        if "=" in expr_str:
+            left, right = expr_str.split("=", 1)
+            expr_str = f"({left.strip()}) - ({right.strip()})"
+
+        local_dict = {'x': x, 'y': y, 'Derivative': Derivative}
+        expr = parse_expr(expr_str, local_dict=local_dict)
+        eq = Eq(expr, 0)
+        print(f"DEBUG: Ecuación SymPy: {eq}")
+
+        sol = dsolve(eq)
+        if sol is None:
+            raise ValueError("SymPy no pudo resolver la ecuación.")
+        print(f"DEBUG: Solución cruda: {sol}")
+
+        rhs = sp.cancel(sol.rhs)
+        rhs = sp.expand(rhs)
+        sol = Eq(sol.lhs, rhs)
+        print(f"DEBUG: Solución simplificada: {sol}")
+
+        steps = [
+            f"\\text{{{eq_type.capitalize()}: }} {sp.latex(eq)}",
+            f"\\text{{Reescritura (lado izquierdo = 0): }} {sp.latex(expr)} = 0",
+            f"\\text{{Solución general: }} {sp.latex(sol)}"
+        ]
+
+        return {"steps": steps}
+
+    except Exception as e:
+        print(f"DEBUG: Error en solve_equation_general: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error al resolver: {str(e)}")
+
+# ------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------
+@app.post("/solve_linear")
+def solve_linear(req: SolveRequest):
+    return solve_linear_detailed(req)
+
+@app.post("/solve_homogeneous_first")
+def solve_homogeneous_first(req: SolveRequest):
+    return solve_homogeneous_first_detailed(req)
+
+@app.post("/solve_homogeneous_second")
+def solve_homogeneous_second(req: SolveRequest):
+    return solve_homogeneous_second_detailed(req)
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
