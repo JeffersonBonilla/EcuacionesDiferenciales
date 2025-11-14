@@ -39,7 +39,9 @@ def solve_linear_detailed(req: SolveRequest):
 
         # Normalizar para SymPy
         expr_str = req.equation.strip()
-        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        # Reemplazar y → y(x) sin destruir dy/dx
+        expr_str = re.sub(r'(?<!d)y(?!\w)', 'y(x)', expr_str)
+
         expr_str = (
             expr_str.replace("dy/dx", "Derivative(y(x), x)")
             .replace("y'", "Derivative(y(x), x)")
@@ -115,7 +117,9 @@ def solve_homogeneous_first_detailed(req: SolveRequest):
 
         # Normalizar para SymPy
         expr_str = req.equation.strip()
-        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+       # Reemplazar y → y(x) sin destruir dy/dx
+        expr_str = re.sub(r'(?<!d)y(?!\w)', 'y(x)', expr_str)
+
         expr_str = expr_str.replace("dy/dx", "Derivative(y(x), x)").replace("^", "**")
 
         if "=" in expr_str:
@@ -174,7 +178,9 @@ def solve_homogeneous_second_detailed(req: SolveRequest):
 
         # Normalizar para SymPy
         expr_str = req.equation.strip()
-        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        # Reemplazar y → y(x) sin destruir dy/dx
+        expr_str = re.sub(r'(?<!d)y(?!\w)', 'y(x)', expr_str)
+
         expr_str = (
             expr_str.replace("d²y/dx²", "Derivative(y(x), (x,2))")
             .replace("dy/dx", "Derivative(y(x), x)")
@@ -224,7 +230,9 @@ def solve_equation_general(req: SolveRequest, eq_type: str = "general"):
     print(f"DEBUG: Recibida ecuación: {req.equation}")
     try:
         expr_str = req.equation.strip()
-        expr_str = re.sub(r'\by\b', 'y(x)', expr_str)
+        # Reemplazar y → y(x) sin destruir dy/dx
+        expr_str = re.sub(r'(?<!d)y(?!\w)', 'y(x)', expr_str)
+
         expr_str = (
             expr_str.replace("dy/dx", "Derivative(y(x), x)")
             .replace("y'", "Derivative(y(x), x)")
